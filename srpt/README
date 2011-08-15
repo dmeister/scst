@@ -1,0 +1,308 @@
+SCSI RDMA Protocol (SRP) Target driver for Linux
+=================================================
+
+The SRP target driver has been designed to work on top of the Linux
+InfiniBand kernel drivers -- either the InfiniBand drivers included
+with a Linux distribution of the OFED InfiniBand drivers. For more
+information about using the SRP target driver in combination with
+OFED, see also README.ofed.
+
+The SRP target driver has been implemented as an SCST driver. This
+makes it possible to support a lot of I/O modes on real and virtual
+devices. A few examples of supported device handlers are:
+
+1. scst_disk. This device handler implements transparent pass-through
+   of SCSI commands and allows SRP to access and to export real
+   SCSI devices, i.e. disks, hardware RAID volumes, tape libraries
+   as SRP LUNs.
+
+2. scst_vdisk, either in fileio or in blockio mode. This device handler
+   allows to export software RAID volumes, LVM volumes, IDE disks, and
+   normal files as SRP LUNs.
+
+3. nullio. The nullio device handler allows to measure the performance
+   of the SRP target implementation without performing any actual I/O.
+
+
+Installation
+------------
+
+Proceed as follows to compile and install the SRP target driver:
+
+1. The SRP initiator (ib_srp) included with Linux kernel 2.6.36 and before
+   frequently makes ib_srpt send BUSY responses, which hurts performance.
+   This can be avoided by making SCST's SCSI command queue size identical
+   to that of the initiator by applying the scst_increase_max_tgt_cmds patch:
+
+   cd ${SCST_DIR}
+   patch -p0 < srpt/patches/scst_increase_max_tgt_cmds.patch
+
+   This patch increases SCST's per-device queue size from 48 to 64. This
+   helps to avoid BUSY conditions because the size of the transmit
+   queue in Linux' SRP initiator is also 64.
+
+   Note: avoiding BUSY conditions is also possible by limiting the number of
+   outstanding requests on the initiator. This is possible either by setting
+   nr_requests low enough or by enabling the dynamic queue depth adjustment
+   feature. Dynamic queue depth adjustment is available from kernel version
+   2.6.33 on.  See also scst/README for more information.
+
+2. Now compile and install SRPT:
+
+   cd ${SCST_DIR}
+   make -s scst_clean scst scst_install
+   make -s srpt_clean srpt srpt_install
+   make -s scstadm scstadm_install
+
+3. Edit the installed file /etc/init.d/scst and add ib_srpt to the
+   SCST_MODULES variable.
+
+4. Configure SCST such that it will be started during system boot:
+
+   chkconfig scst on
+
+The ib_srpt kernel module supports the following parameters:
+* srp_max_req_size (number)
+  Maximum size of an SRP control message in bytes. Examples of SRP control
+  messages are: login request, logout request, data transfer request, ...
+  The larger this parameter, the more scatter/gather list elements can be
+  sent at once. Use the following formula to compute an appropriate value
+  for this parameter: 68 + 16 * (sg_tablesize). The default value of
+  this parameter is 2116, which corresponds to an sg table size of 128.
+* srp_max_rsp_size (number)
+  Maximum size of an SRP response message in bytes. Sense data is sent back
+  via these messages towards the initiator. The default size is 256 bytes.
+  With this value there remains (256-36) = 220 bytes for sense data.
+* srp_max_rdma_size (number)
+  Maximum number of bytes that may be transferred at once via RDMA. Defaults
+  to 65536 bytes, which is sufficient to use the full bandwidth of low-latency
+  HCAs. Increasing this value may decrease latency for applications
+  transferring large amounts of data at once.
+* srpt_srq_size (number, default 4095)
+  ib_srpt uses a shared receive queue (SRQ) for processing incoming SRP
+  requests. This number may have to be increased when a large number of
+  initiator systems is accessing a single SRP target system.
+* srpt_sq_size (number, default 4096)
+  Per-channel InfiniBand send queue size. The default setting is sufficient
+  for a credit limit of 128. Changing this parameter to a smaller value may
+  cause RDMA requests to be retried and hence may slow down data transfer
+  severely.
+* trace_flag (unsigned integer, only available in debug builds)
+  The individual bits of the trace_flag parameter define which categories of
+  trace messages should be sent to the kernel log and which ones not.
+
+
+Configuring the SRP Target System
+---------------------------------
+
+First of all, create the file /etc/scst.conf. You can create this file with
+the scstadmin tool as follows:
+
+  /etc/init.d/scst stop
+  /etc/init.d/scst start
+
+Now configure SCST using scstadmin - see also the scstadmin documentation for
+further information. Once finished, save the configuration to /etc/scst.conf:
+
+  scstadmin -write_config /etc/scst.conf  (sysfs version)
+or
+  scstadmin -WriteConfig /etc/scst.conf   (procfs version)
+
+One can verify the contents of scst.conf e.g. as follows:
+
+  cat /etc/scst.conf
+
+Now verify that loading the configuration from file works correctly:
+
+  /etc/init.d/scst reload
+
+
+Configuring the SRP Initiator System
+------------------------------------
+
+First of all, load the SRP kernel module as follows:
+
+   modprobe ib_srp
+
+Next, discover the new SRP target by running the ibsrpdm command:
+
+   ibsrpdm -c
+
+If you want to let the initiator system log in to all SRP targets available
+in the same InfiniBand subnet that is possible as follows:
+
+   ibsrpdm -c | while read target_info; do echo "${target_info}" > /sys/class/infiniband_srp/${SRP_HCA_NAME}/add_target; done
+
+If you want to let the initiator log in to a specific target you can do that
+e.g. as follows:
+
+   echo "id_ext=0002c903000f1366,ioc_guid=0002c903000f1366,dgid=fe800000000000000002c903000f1367,pkey=ffff,service_id=0002c903000f1366" > /sys/class/infiniband_srp/${SRP_HCA_NAME}/add_target; done
+
+The meaning of the parameters in the above command is as follows:
+   * id_ext: must match ioc_guid.
+   * ioc_guid: see also the documentation of the ib_srpt ioc_guid parameter.
+   * dgid: target HCA port GID to connect to.
+   * pkey: IB partition key (P_Key) of the target to connect to.
+   * service_id: must match ioc_guid.
+
+Target GIDs can be queried e.g. via sysfs:
+
+$ for f in /sys/devices/*/*/*/infiniband/*/ports/*/gids/0; do echo $f; \
+cat $f | cut -c21- | sed 's/://g'; done
+/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/infiniband/mlx4_0/ports/1/gids/0
+0002c9030005f34b
+/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/infiniband/mlx4_0/ports/2/gids/0
+0002c9030005f34c
+/sys/devices/pci0000:00/0000:00:1c.0/0000:05:00.0/infiniband/mlx4_1/ports/1/gids/0
+0002c9030003cca7
+/sys/devices/pci0000:00/0000:00:1c.0/0000:05:00.0/infiniband/mlx4_1/ports/2/gids/0
+0002c9030003cca8
+
+Finally run lsscsi to display the details of the newly discovered SCSI disks:
+
+   lsscsi
+
+SRP targets can be recognized in the output of lsscsi by looking for
+the disk names assigned on the SCST target ("disk01" in the example below):
+
+   [8:0:0:0]    disk    SCST_FIO disk01            102  /dev/sdb
+
+
+Target names
+------------
+
+The name assigned by the ib_srpt target driver to an SCST target is the node
+GUID of a HCA in hexadecimal form with a colon after every fourth digit. The
+HCA node GUIDs can be obtained via the ibv_devices command, the ibv_devinfo
+command or via sysfs. An example:
+
+# ibv_devices
+    device                 node GUID
+    ------              ----------------
+    mlx4_1              0002c9030003cca2
+    mlx4_0              0002c9030005f34e
+
+# head /sys/devices/*/*/*/infiniband/*/node_guid
+==> /sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/infiniband/mlx4_0/node_guid <==
+0002:c903:0005:f34e
+
+==> /sys/devices/pci0000:00/0000:00:1c.0/0000:05:00.0/infiniband/mlx4_1/node_guid <==
+0002:c903:0003:cca2
+
+Once the ib_srpt driver has been loaded there will be SCST targets available
+with the HCA node GUID as name:
+
+# ls /sys/bus/scst_target/drivers/ib_srpt/0*
+0002:c903:0003:cca2  0002:c903:0005:f34e
+
+If you need deprecated target names in form ib_srpt_target_X, you should
+set use_node_guid_in_target_name parameter of module ib_srpt to 0.
+
+To move from the deprecated ib_srpt_target_X layout you should replace
+in your scst.conf all ib_srpt_target_X to the corresponding ports names,
+like ib_srpt_target_0 to 0002:c902:0022:16f4, if ibv_devices reported
+for this port/node GUID 0002c902002216f4.
+
+
+Session names
+-------------
+
+The ib_srpt target driver uses the 128-bit SRP initiator port identifier for
+the session name. This identifier is sent by the SRP initiator to the SRP
+target via the SRP_LOGIN_REQ information unit. The Linux SRP initiator
+(ib_srp) generates the initiator port identifier as follows:
+- The first eight bytes are the identifier extension ('initiator_ext' parameter
+  specified in the login string echoed into the sysfs file 'add_target').
+- The last eight bytes are the GUID of the initiator HCA port used to
+  communicate with the target.
+
+An example:
+
+[ INITIATOR ]
+
+$ for f in /sys/devices/*/*/*/infiniband/*/ports/*/gids/0; do echo
+f; cat $f | cut -c21-; done
+/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/infiniband/mlx4_0/ports/1/gids/0
+0002:c903:0005:f34b
+/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/infiniband/mlx4_0/ports/2/gids/0
+0002:c903:0005:f34c
+/sys/devices/pci0000:00/0000:00:1c.0/0000:05:00.0/infiniband/mlx4_1/ports/1/gids/0
+0002:c903:0003:cca7
+/sys/devices/pci0000:00/0000:00:1c.0/0000:05:00.0/infiniband/mlx4_1/ports/2/gids/0
+0002:c903:0003:cca8
+
+[ TARGET, after login ]
+
+$ ls /sys/bus/scst_target/drivers/ib_srpt/*/sessions
+/sys/bus/scst_target/drivers/ib_srpt/0002:c903:0003:cca2/sessions:
+0x00000000000000000002c9030003cca7
+
+/sys/bus/scst_target/drivers/ib_srpt/0002:c903:0005:f34e/sessions:
+0x00000000000000000002c9030005f34b
+
+
+Adding and Removing LUNs Dynamically
+------------------------------------
+
+It is possible to add and/or remove LUNs on the target without restarting
+target or initiator. This can be done either via scstadmin or directly via the
+sysfs interface. Although the SCST core will notify the initiator about LUN
+changes, Linux initiators will ignore these notifications. In order to bring a
+Linux initiator again in sync after a LUN change, the initiator has to be told
+to rescan SCSI devices. Rescanning SCSI devices is e.g. possible via the
+rescsan-scsi-bus.sh script that can be found here:
+http://www.garloff.de/kurt/linux/#rescan-scsi. An example:
+$ rescan-scsi-bus --hosts=${srp_host_id} --channels=0 --ids=0 --luns=0-31
+
+
+High availability
+-----------------
+
+If there are redundant paths in the IB network between initiator and target,
+automatic path failover can be set up on the initiator as follows:
+* Edit /etc/infiniband/openib.conf to load the SRP driver and SRP HA daemon
+  automatically: set SRP_LOAD=yes and SRPHA_ENABLE=yes.
+* To set up and use the high availability feature you need the dm-multipath
+  driver and multipath tool.
+* Please refer to the OFED-1.x user manual for more detailed instructions
+  on how to enable and how to use the HA feature. See e.g.
+  http://www.mellanox.com/related-docs/prod_software/Mellanox_OFED%20_Linux_user_manual_1_5_1_2.pdf.
+
+A setup with automatic failover between redundant targets is possible by
+installing and configuring DRBD on both targets. If the initiator system
+supports mirroring (e.g. Linux), you can use the following approach:
+* Configure DRBD in Active/Active mode.
+* Configure the initiator(s) for mirroring between the redundant targets.
+If the initiator system does not support mirroring (e.g. VMware ESX), you
+can use the following approach:
+* Configure DRBD in Active/Passive mode and enable STONITH mode in the
+  Heartbeat software.
+
+For more information, see also:
+* http://www.drbd.org/
+* http://www.linux-ha.org/wiki/Main_Page
+
+
+Notes about ib_srpt
+-------------------
+
+* Unloading the kernel module ib_srpt while I/O is ongoing is supported.
+  However, it can take up to two minutes before unloading finishes. During
+  that time CPU usage will be high.
+
+
+Performance Notes - Initiator Side
+----------------------------------
+
+* For latency sensitive applications, using the noop scheduler at the initiator
+  side can give significantly better results than with other schedulers.
+
+* The following parameters have a small but measurable impact on SRP
+  performance:
+  * /sys/class/block/${dev}/queue/rotational
+  * /sys/class/block/${dev}/queue/rq_affinity
+  * /proc/irq/${ib_int_no}/smp_affinity
+
+
+Send questions about this driver to scst-devel@lists.sourceforge.net, CC:
+Vu Pham <vuhuong@mellanox.com> and Bart Van Assche <bvanassche@acm.org>.
