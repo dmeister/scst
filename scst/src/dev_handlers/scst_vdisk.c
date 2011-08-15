@@ -173,6 +173,17 @@ struct scst_vdisk_dev {
 
 	struct scst_device *dev;
 	struct list_head vdev_list_entry;
+	
+    atomic_t write_requests;
+    atomic_t write_request_time;
+    atomic_t read_requests;
+    atomic_t read_request_time;
+    
+    /*
+     * extra latency in us
+     */
+    unsigned int extra_read_latency_us;
+    unsigned int extra_write_latency_us;
 
 	struct scst_dev_type *vdev_devt;
 };
@@ -2683,11 +2694,14 @@ static void vdisk_exec_read(struct scst_cmd *cmd,
 	struct iovec *iv;
 	int iv_count, i;
 	bool finished = false;
-
+    u64 start, end;
+    
 	TRACE_ENTRY();
 
 	if (virt_dev->nullio)
 		goto out;
+
+    start = jiffies;
 
 	iv = vdisk_alloc_iv(cmd, thr);
 	if (iv == NULL)
@@ -2772,6 +2786,10 @@ static void vdisk_exec_read(struct scst_cmd *cmd,
 		length = scst_get_buf_next(cmd, (uint8_t __force **)&address);
 	};
 
+    end = jiffies;
+    atomic_inc(&virt_dev->write_requests);
+    atomic_add(&virt_dev->write_request_time, (end - start));
+
 	set_fs(old_fs);
 
 out:
@@ -2797,11 +2815,15 @@ static void vdisk_exec_write(struct scst_cmd *cmd,
 	struct iovec *iv, *eiv;
 	int i, iv_count, eiv_count;
 	bool finished = false;
+    volatile u64 start;
+    volatile u64 end;
 
 	TRACE_ENTRY();
 
 	if (virt_dev->nullio)
 		goto out;
+
+    start = jiffies;
 
 	iv = vdisk_alloc_iv(cmd, thr);
 	if (iv == NULL)
@@ -2918,6 +2940,10 @@ restart:
 		length = scst_get_buf_next(cmd, (uint8_t __force **)&address);
 	}
 
+    end = jiffies;
+    atomic_inc(&virt_dev->write_requests);
+    atomic_add(&virt_dev->write_request_time, (end - start));
+    
 	set_fs(old_fs);
 
 out:
@@ -3449,7 +3475,14 @@ static int vdev_create(struct scst_dev_type *devt,
 
 	virt_dev->block_size = DEF_DISK_BLOCKSIZE;
 	virt_dev->block_shift = DEF_DISK_BLOCKSIZE_SHIFT;
-
+	
+    virt_dev->extra_read_latency_us = 0;
+    virt_dev->extra_write_latency_us = 0;
+    atomic_set(&virt_dev->write_requests, 0);
+    atomic_set(&virt_dev->write_request_time, 0);
+    atomic_set(&virt_dev->read_requests, 0);
+    atomic_set(&virt_dev->read_request_time, 0);
+    
 	if (strlen(name) >= sizeof(virt_dev->name)) {
 		PRINT_ERROR("Name %s is too long (max allowed %zd)", name,
 			sizeof(virt_dev->name)-1);
@@ -4688,6 +4721,11 @@ static int vdisk_read_proc(struct seq_file *seq, struct scst_dev_type *dev_type)
 			seq_printf(seq, "RM ");
 			c += 4;
 		}
+        c += seqprintf(seq, "WR %d ", (int)atomic_read(&virt_dev->write_requests));
+        c += seqprintf(seq, "WL %d ", (int)atomic_read(&virt_dev->write_request_time) * HZ / 1000000LL);
+        c += seqprintf(seq, "RR %d ", (int)atomic_read(&virt_dev->read_requests));
+        c += seqprintf(seq, "RL %d ", (int)atomic_read(&virt_dev->read_request_time) * HZ / 1000000LL);
+        
 		while (c < 16) {
 			seq_printf(seq, " ");
 			c++;
