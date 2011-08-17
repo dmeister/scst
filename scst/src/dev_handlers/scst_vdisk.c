@@ -45,6 +45,7 @@
 #include <linux/slab.h>
 #include <linux/bio.h>
 #include <linux/crc32c.h>
+#include <linux/delay.h>
 
 #define LOG_PREFIX			"dev_vdisk"
 
@@ -413,7 +414,7 @@ static struct scst_dev_type vdisk_file_devtype = {
 	.del_device =		vdisk_del_device,
 	.dev_attrs =		vdisk_fileio_attrs,
 	.add_device_parameters = "filename, blocksize, write_through, "
-		"nv_cache, o_direct, read_only, removable, thin_provisioned",
+		"nv_cache, o_direct, read_only, removable, thin_provisioned, read_latency, write_latency",
 #endif
 #if defined(CONFIG_SCST_DEBUG) || defined(CONFIG_SCST_TRACING)
 	.default_trace_flags =	SCST_DEFAULT_DEV_LOG_FLAGS,
@@ -2694,14 +2695,21 @@ static void vdisk_exec_read(struct scst_cmd *cmd,
 	struct iovec *iv;
 	int iv_count, i;
 	bool finished = false;
-    u64 start, end;
-    
+    struct timeval start;
+    struct timeval end;
+	u64 uc;
+	
 	TRACE_ENTRY();
+
+    do_gettimeofday(&start);
 
 	if (virt_dev->nullio)
 		goto out;
 
-    start = jiffies;
+	if (virt_dev->extra_read_latency_us) {
+	    schedule();
+	    udelay(virt_dev->extra_read_latency_us);
+	}
 
 	iv = vdisk_alloc_iv(cmd, thr);
 	if (iv == NULL)
@@ -2786,13 +2794,14 @@ static void vdisk_exec_read(struct scst_cmd *cmd,
 		length = scst_get_buf_next(cmd, (uint8_t __force **)&address);
 	};
 
-    end = jiffies;
-    atomic_inc(&virt_dev->write_requests);
-    atomic_add(&virt_dev->write_request_time, (end - start));
-
 	set_fs(old_fs);
 
 out:
+    do_gettimeofday(&end);
+    uc = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
+    atomic_inc(&virt_dev->read_requests);
+    atomic_add(uc, &virt_dev->read_request_time);
+
 	TRACE_EXIT();
 	return;
 
@@ -2815,15 +2824,21 @@ static void vdisk_exec_write(struct scst_cmd *cmd,
 	struct iovec *iv, *eiv;
 	int i, iv_count, eiv_count;
 	bool finished = false;
-    volatile u64 start;
-    volatile u64 end;
+    struct timeval start;
+    struct timeval end;
+	u64 uc;
 
 	TRACE_ENTRY();
 
+    do_gettimeofday(&start);
+
 	if (virt_dev->nullio)
 		goto out;
-
-    start = jiffies;
+		
+	if (virt_dev->extra_write_latency_us) {
+	    schedule();
+	    udelay(virt_dev->extra_write_latency_us);
+	}
 
 	iv = vdisk_alloc_iv(cmd, thr);
 	if (iv == NULL)
@@ -2938,15 +2953,15 @@ restart:
 
 		loff += saved_full_len;
 		length = scst_get_buf_next(cmd, (uint8_t __force **)&address);
-	}
-
-    end = jiffies;
-    atomic_inc(&virt_dev->write_requests);
-    atomic_add(&virt_dev->write_request_time, (end - start));
-    
+	}    
 	set_fs(old_fs);
 
 out:
+    do_gettimeofday(&end);
+    uc = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
+    atomic_inc(&virt_dev->write_requests);
+    atomic_add(uc, &virt_dev->write_request_time);
+
 	TRACE_EXIT();
 	return;
 
@@ -3657,6 +3672,10 @@ static int vdev_parse_add_dev_params(struct scst_vdisk_dev *virt_dev,
 			TRACE_DBG("block_size %d, block_shift %d",
 				virt_dev->block_size,
 				virt_dev->block_shift);
+		} else if (!strcasecmp("read_latency", o)) {
+            strict_strtoul(pp, 0, &virt_dev->extra_read_latency);
+    	} else if (!strcasecmp("write_latency", o)) {
+            strict_strtoul(pp, 0, &virt_dev->extra_write_latency);
 		} else {
 			PRINT_ERROR("Unknown parameter %s (device %s)", p,
 				virt_dev->name);
@@ -4721,10 +4740,10 @@ static int vdisk_read_proc(struct seq_file *seq, struct scst_dev_type *dev_type)
 			seq_printf(seq, "RM ");
 			c += 4;
 		}
-        c += seqprintf(seq, "WR %d ", (int)atomic_read(&virt_dev->write_requests));
-        c += seqprintf(seq, "WL %d ", (int)atomic_read(&virt_dev->write_request_time) * HZ / 1000000LL);
-        c += seqprintf(seq, "RR %d ", (int)atomic_read(&virt_dev->read_requests));
-        c += seqprintf(seq, "RL %d ", (int)atomic_read(&virt_dev->read_request_time) * HZ / 1000000LL);
+        seq_printf(seq, "WR %d ", atomic_read(&virt_dev->write_requests));
+        seq_printf(seq, "WL %d ", (atomic_read(&virt_dev->write_request_time)));
+        seq_printf(seq, "RR %d ", atomic_read(&virt_dev->read_requests));
+        seq_printf(seq, "RL %d ", (atomic_read(&virt_dev->read_request_time)));
         
 		while (c < 16) {
 			seq_printf(seq, " ");
@@ -4787,6 +4806,9 @@ static int vdisk_write_proc(char *buffer, char **start, off_t offset,
 	} else if (!strncmp("set_t10_dev_id ", p, 15)) {
 		p += 15;
 		action = 3;
+	} else if (!strncmp("delay ", p, 6)) {
+        p += 6;
+        action = 4;
 	} else {
 		PRINT_ERROR("Unknown action \"%s\"", p);
 		res = -EINVAL;
@@ -5022,6 +5044,29 @@ static int vdisk_write_proc(char *buffer, char **start, off_t offset,
 			virt_dev->name, virt_dev->t10_dev_id);
 
 		write_unlock(&vdisk_serial_rwlock);
+	} else if (action == 4) {
+        char *pp;
+		virt_dev = NULL;
+		list_for_each_entry(vv, &vdev_list,
+					vdev_list_entry) {
+			if (strcmp(vv->name, name) == 0) {
+				virt_dev = vv;
+				break;
+			}
+		}
+		if (virt_dev == NULL) {
+			PRINT_ERROR("Device %s not found", name);
+			res = -EINVAL;
+			goto out_up;
+		}
+		while (isspace(*p) && *p != '\0')
+    		p++;
+		virt_dev->extra_read_latency_us = simple_strtoul(p, &pp, 0);
+		p = pp;
+        while (isspace(*p) && *p != '\0')
+    		p++;
+		virt_dev->extra_write_latency_us = simple_strtoul(p, &pp, 0);
+        PRINT_INFO("Delay for device %s changed to %u/%u", virt_dev->name, virt_dev->extra_read_latency_us, virt_dev->extra_write_latency_us);
 	}
 	res = length;
 
